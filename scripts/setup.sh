@@ -24,7 +24,8 @@ echo "Namespace: ${INSTALLER_NAMESPACE}"
 echo ""
 
 # Apply default network attachment definition for VMs
-cat <<EOF | oc apply -f -
+if [[ "${VIRT_SERVICE}" == "true" ]]; then
+    cat <<EOF | oc apply -f -
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:
@@ -33,6 +34,7 @@ metadata:
 spec:
   config: '{"cniVersion": "0.4.0", "name": "ovn-kubernetes", "type": "ovn-k8s-cni-overlay"}'
 EOF
+fi
 
 # Optionally install LVMS as storage service (must be before keycloak which needs a default storage class)
 if [[ "${STORAGE_SERVICE}" == "true" ]]; then
