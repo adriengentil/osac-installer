@@ -91,6 +91,56 @@ patches:
             containers:
               - name: controller
                 imagePullPolicy: Always
+                command:
+                - /usr/local/bin/fulfillment-service
+                - start
+                - controller
+                - --log-level=debug
+                - --log-headers=false
+                - --log-bodies=true
+                - --ca-file=/etc/fulfillment-controller/tls/cas
+                - --auth-issuer-url=https://keycloak-keycloak.apps.osac-integration.svc.massopen.cloud/realms/osac
+                - --auth-client-id-file=/etc/fulfillment-controller/credentials/client-id
+                - --auth-client-secret-file=/etc/fulfillment-controller/credentials/client-secret
+                - --idp-provider=keycloak
+                - --idp-url=https://keycloak-keycloak.apps.osac-integration.svc.massopen.cloud
+                - --idp-client-id-file=/etc/fulfillment-controller/idp/client-id
+                - --idp-client-secret-file=/etc/fulfillment-controller/idp/client-secret
+                - --grpc-server-address=fulfillment-internal-api:8001
+                - --grpc-keep-alive=5m
+                - --grpc-listener-address=0.0.0.0:8000
+                - --grpc-listener-tls-crt=/etc/fulfillment-controller/tls/tls.crt
+                - --grpc-listener-tls-key=/etc/fulfillment-controller/tls/tls.key
+                - --metrics-listener-address=0.0.0.0:8002
+
+  - patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: fulfillment-grpc-server
+      spec:
+        template:
+          spec:
+            containers:
+              - name: grpc-server
+                command:
+                - /usr/local/bin/fulfillment-service
+                - start
+                - grpc-server
+                - --log-level=debug
+                - --log-headers=false
+                - --log-bodies=true
+                - --ca-file=/etc/fulfillment-grpc-server/tls/cas
+                - --db-url=postgres://client@fulfillment-database:5432/service?sslmode=verify-full&sslcert=/secrets/cert/tls.crt&sslkey=/secrets/cert/tls.key&sslrootcert=/secrets/cert/ca.crt
+                - --grpc-listener-address=0.0.0.0:8000
+                - --grpc-listener-tls-crt=/etc/fulfillment-grpc-server/tls/tls.crt
+                - --grpc-listener-tls-key=/etc/fulfillment-grpc-server/tls/tls.key
+                - --grpc-authn-trusted-token-issuers=https://keycloak-keycloak.apps.osac-integration.svc.massopen.cloud/realms/osac
+                - --grpc-authn-type=external
+                - --grpc-authn-external-address=authorino-authorino-authorization:50051
+                - --tenancy-logic=default
+                - --metrics-listener-address=0.0.0.0:8002
+
   - target:
       kind: Deployment
       name: osac-operator-controller-manager
@@ -153,7 +203,7 @@ patches:
         path: /spec/template/spec/containers/0/env/-
         value:
           name: OSAC_FULFILLMENT_SERVER_ADDRESS
-          value: fulfillment-api:8000
+          value: fulfillment-internal-api:8001
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value:
@@ -186,76 +236,104 @@ patches:
         name: fulfillment-service
       spec:
         authentication:
+          fulfillment-api:
+            kubernetesTokenReview:
+              audiences:
+              - https://kubernetes.default.svc
+              - https://kubernetes.default.svc.cluster.local
+            metrics: false
+            overrides:
+              authnMethod:
+                value: serviceaccount
+            priority: 0
           keycloak-jwt:
             jwt:
-              issuerUrl: https://keycloak.keycloak.svc.cluster.local/realms/osac
+              issuerUrl: https://keycloak-keycloak.apps.osac-integration.svc.massopen.cloud/realms/osac
+            metrics: false
+            overrides:
+              authnMethod:
+                value: jwt
+            priority: 0
         authorization:
           default:
+            metrics: false
             opa:
+              allValues: true
               rego: |
-                import future.keywords.in
+                import rego.v1
 
-                # Define admin subjects for osac-devel namespace:
-                admin_subjects := {
+                # Emergency service accounts are Kubernetes service accounts that are allowed to act as administrators in case
+                # of emergency situations where it isn't possible to get a valid JWT token from the identity provider.
+                emergency_service_accounts := {
                   "system:serviceaccount:osac-integration:admin",
                   "system:serviceaccount:osac-integration:controller",
                   "system:serviceaccount:osac-integration:template-publisher",
                   "system:serviceaccount:osac-integration:osac-operator-controller-manager",
                 }
 
+                # Admin service accounts are service accounts that are allowed to act as administrators.
+                admin_service_accounts := {
+                  "service-account-osac-admin",
+                  "service-account-osac-controller",
+                  "service-account-fulfillment-controller",
+                }
+
+                # Admin groups are groups that are allowed to act as administrators.
+                admin_groups := {
+                  "admins",
+                }
+
                 # Get the gRPC method:
                 grpc_method := input.context.request.http.path
 
                 # Get the subject name:
-                subject_name = input.auth.identity.user.username {
+                subject_name = input.auth.identity.user.username if {
                   input.auth.identity.authnMethod == "serviceaccount"
                 }
-                subject_name = input.auth.identity.username {
+                subject_name = input.auth.identity.username if {
                   input.auth.identity.authnMethod == "jwt"
                 }
 
-                # Get the groups (for JWT users):
-                subject_groups = input.auth.identity.user.groups {
+                # Get the subject groups:
+                subject_groups = input.auth.identity.user.groups if {
                   input.auth.identity.authnMethod == "serviceaccount"
                 }
-                subject_groups = input.auth.identity.groups {
+                subject_groups = input.auth.identity.groups if {
                   input.auth.identity.authnMethod == "jwt"
                 }
 
-                # Function to check if an account is an admin account:
-                is_admin {
-                  subject_name in admin_subjects
+                # Check if an account is an admin account:
+                default is_admin = false
+                is_admin if {
+                  subject_name in emergency_service_accounts
+                }
+                is_admin if {
+                  subject_name in admin_service_accounts
+                }
+                is_admin if {
+                  some group in subject_groups
+                  group in admin_groups
                 }
 
-                # Function to check if a JWT user is an admin (in admins group or has tenant-admin role):
-                is_jwt_admin {
-                  input.auth.identity.authnMethod == "jwt"
-                  "admins" in subject_groups
-                }
-                is_jwt_admin {
-                  input.auth.identity.authnMethod == "jwt"
-                  "tenant-admin" in input.auth.identity.realm_access.roles
-                }
-
-                # Function to check if an account is a client account:
-                is_client {
+                # Check if an account is a client account:
+                default is_client = false
+                is_client if {
                   not is_admin
-                  not is_jwt_admin
                 }
 
                 # Allow metadata, reflection and health to everyone:
-                allow {
+                allow if {
                   startswith(grpc_method, "/metadata.")
                 }
-                allow {
+                allow if {
                   startswith(grpc_method, "/grpc.reflection.")
                 }
-                allow {
+                allow if {
                   startswith(grpc_method, "/grpc.health.")
                 }
 
                 # Allow specific methods to clients:
-                allow {
+                allow if {
                   is_client
                   grpc_method in {
                     "/osac.public.v1.ClusterTemplates/Get",
@@ -303,13 +381,37 @@ patches:
                     "/osac.public.v1.PublicIPs/Delete",
                     "/osac.public.v1.PublicIPs/Get",
                     "/osac.public.v1.PublicIPs/List",
+                    "/osac.public.v1.Roles/Get",
+                    "/osac.public.v1.Roles/List",
+                    "/osac.public.v1.RoleBindings/Get",
+                    "/osac.public.v1.RoleBindings/List",
                   }
                 }
 
-                # Allow everything to admins (service accounts or JWT users in admins group):
-                allow {
+                # Allow everything to admins:
+                allow if {
                   is_admin
                 }
-                allow {
-                  is_jwt_admin
-                }
+            priority: 0
+        hosts:
+        - '*'
+        response:
+          success:
+            headers:
+              x-subject:
+                json:
+                  properties:
+                    tenants:
+                      expression: |
+                        auth.authorization.default.is_admin
+                          ? ["*"]
+                          : auth.identity.authnMethod == "jwt"
+                            ? auth.identity.groups
+                            : [auth.identity.user.username.split(":")[2]]
+                    user:
+                      expression: |
+                        auth.identity.authnMethod == "jwt"
+                          ? auth.identity.username
+                          : auth.identity.user.username.split(":")[3]
+                metrics: false
+                priority: 0
