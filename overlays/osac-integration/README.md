@@ -33,3 +33,17 @@ oc create secret generic fulfillment-controller-credentials \
 ```
 
 `client-secret` must match the secret configured for the `osac-controller` client in the Keycloak realm ([prerequisites/keycloak/service/files/realm.json](../../prerequisites/keycloak/service/files/realm.json)).
+
+## Deployment
+
+Review changes before applying:
+
+```sh
+oc diff -k overlays/osac-integration/
+```
+
+Apply the configuration:
+
+```sh
+oc apply -k overlays/osac-integration/
+```
